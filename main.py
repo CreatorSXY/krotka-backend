@@ -6,7 +6,11 @@ import hashlib
 
 # ========= 数据库配置：用一个本地文件 database.db =========
 DATABASE_URL = "sqlite:///./database.db"
-engine = create_engine(DATABASE_URL, echo=False)
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"check_same_thread": False},
+)
 
 app = FastAPI(title="Validation Platform MVP")
 
@@ -26,14 +30,16 @@ class User(SQLModel, table=True):
     email: str = Field(index=True, unique=True)
     name: str
     password_hash: str
-    role: str = "user"  # "user" 或 "creator"
+    role: str = "tester"             # "creator" or "tester"
+    subscription: str = "free"       # "free", "creator_basic", "creator_plus"
 
 
 class UserCreate(SQLModel):
     email: str
     name: str
     password: str
-    role: str = "user"  # 传 "creator" 就是创业者账号
+    role: str = "tester"        # "creator" or "tester"
+    subscription: str = "free"  # only meaningful for creators
 
 
 class UserLogin(SQLModel):
@@ -46,6 +52,7 @@ class UserOut(SQLModel):
     email: str
     name: str
     role: str
+    subscription: str
 
 
 class Project(SQLModel, table=True):
@@ -102,7 +109,7 @@ class ResponseCreate(SQLModel):
 
 class ProjectStats(SQLModel):
     project_id: int
-    total_responses: int
+    responses_count: int
     avg_interest: Optional[float]
     avg_price_min: Optional[float]
     avg_price_max: Optional[float]
@@ -138,11 +145,23 @@ def register(user: UserCreate, session: Session = Depends(get_session)):
     existing = session.exec(select(User).where(User.email == user.email)).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    if user.role not in {"creator", "tester"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    if user.subscription not in {"free", "creator_basic", "creator_plus"}:
+        raise HTTPException(status_code=400, detail="Invalid subscription plan")
+
+    # Testers should always be on the free plan
+    if user.role == "tester" and user.subscription != "free":
+        raise HTTPException(status_code=400, detail="Testers can only use free plan")
+
     db_user = User(
         email=user.email,
         name=user.name,
         password_hash=hash_password(user.password),
         role=user.role,
+        subscription=user.subscription,
     )
     session.add(db_user)
     session.commit()
@@ -155,8 +174,12 @@ def login(data: UserLogin, session: Session = Depends(get_session)):
     user = session.exec(select(User).where(User.email == data.email)).first()
     if not user or user.password_hash != hash_password(data.password):
         raise HTTPException(status_code=400, detail="Invalid email or password")
-    # 不搞复杂鉴权，先返回 user_id，前端后面自己带着用
-    return {"user_id": user.id, "role": user.role, "name": user.name}
+    return {
+        "user_id": user.id,
+        "role": user.role,
+        "name": user.name,
+        "subscription": user.subscription,
+    }
 
 
 # ====================== 创业者创建验证项目 ======================
@@ -166,6 +189,9 @@ def create_project(p: ProjectCreate, session: Session = Depends(get_session)):
     creator = session.get(User, p.creator_id)
     if not creator or creator.role != "creator":
         raise HTTPException(status_code=400, detail="creator_id is invalid or not a creator")
+
+    if creator.subscription not in {"creator_basic", "creator_plus"}:
+        raise HTTPException(status_code=403, detail="Creator subscription required to post")
 
     questions_text = "\n".join(p.questions)
     proj = Project(
@@ -272,7 +298,7 @@ def project_stats(project_id: int, session: Session = Depends(get_session)):
     if total == 0:
         return ProjectStats(
             project_id=project_id,
-            total_responses=0,
+            responses_count=0,
             avg_interest=None,
             avg_price_min=None,
             avg_price_max=None,
@@ -292,11 +318,27 @@ def project_stats(project_id: int, session: Session = Depends(get_session)):
 
     return ProjectStats(
         project_id=project_id,
-        total_responses=total,
+        responses_count=total,
         avg_interest=avg_interest,
         avg_price_min=avg_price_min,
         avg_price_max=avg_price_max,
     )
+
+# ====================== 预留AI总结接口 ======================
+
+@app.get("/projects/{project_id}/ai-summary")
+def ai_summary(project_id: int, session: Session = Depends(get_session)):
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    creator = session.get(User, project.creator_id)
+    if not creator or creator.subscription != "creator_plus":
+        raise HTTPException(status_code=403, detail="Plus subscription required")
+
+    # TODO: aggregate responses, call LLM, return summary
+    return {"summary": "AI summary feature is coming soon."}
+
 
 # ====================== 网站运行状态 ======================
 
