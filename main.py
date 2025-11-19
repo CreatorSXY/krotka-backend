@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from typing import Optional, List
+from datetime import datetime
 import hashlib
 
 # ========= 数据库配置：用一个本地文件 database.db =========
@@ -32,6 +33,7 @@ class User(SQLModel, table=True):
     password_hash: str
     role: str = "tester"             # "creator" or "tester"
     subscription: str = "free"       # "free", "creator_basic", "creator_plus"
+    points: int = 0                  # 平台积分，用于激励 / 惩罚
 
 
 class UserCreate(SQLModel):
@@ -98,6 +100,12 @@ class Response(SQLModel, table=True):
     price_min: Optional[int] = None
     price_max: Optional[int] = None
 
+    # 激励机制相关字段
+    accepted_by_creator: bool = False
+    accepted_at: Optional[datetime] = None
+    likes_count: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
 
 class ResponseCreate(SQLModel):
     user_id: int
@@ -105,6 +113,23 @@ class ResponseCreate(SQLModel):
     answers: List[str]
     price_min: Optional[int] = None
     price_max: Optional[int] = None
+
+
+class ResponseOut(SQLModel):
+    id: int
+    project_id: int
+    user_id: int
+    interest_level: int
+    answers: List[str]
+    price_min: Optional[int] = None
+    price_max: Optional[int] = None
+    accepted_by_creator: bool
+    likes_count: int
+    created_at: datetime
+
+
+class AcceptResponsePayload(SQLModel):
+    creator_id: int   # 前端传入当前登录的 creator_id，用于权限校验
 
 
 class ProjectStats(SQLModel):
@@ -282,6 +307,80 @@ def respond_to_project(
     return {"ok": True}
 
 
+# ====================== 创业者 / 平台查看某项目的全部回答 ======================
+
+@app.get("/projects/{project_id}/responses", response_model=list[ResponseOut])
+def list_project_responses(project_id: int, session: Session = Depends(get_session)):
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    responses = session.exec(
+        select(Response).where(Response.project_id == project_id)
+    ).all()
+
+    result: List[ResponseOut] = []
+    for r in responses:
+        result.append(
+            ResponseOut(
+                id=r.id,
+                project_id=r.project_id,
+                user_id=r.user_id,
+                interest_level=r.interest_level,
+                answers=r.answers.split("\n"),
+                price_min=r.price_min,
+                price_max=r.price_max,
+                accepted_by_creator=r.accepted_by_creator,
+                likes_count=r.likes_count,
+                created_at=r.created_at,
+            )
+        )
+    return result
+
+
+# ====================== 创业者采纳某条回答（激励基础版） ======================
+
+@app.post("/responses/{response_id}/accept")
+def accept_response(
+    response_id: int,
+    payload: AcceptResponsePayload,
+    session: Session = Depends(get_session),
+):
+    resp = session.get(Response, response_id)
+    if not resp:
+        raise HTTPException(status_code=404, detail="Response not found")
+
+    project = session.get(Project, resp.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # 只能由该项目的创业者执行采纳
+    if project.creator_id != payload.creator_id:
+        raise HTTPException(status_code=403, detail="Only the project creator can accept a response")
+
+    if resp.accepted_by_creator:
+        raise HTTPException(status_code=400, detail="Response already accepted")
+
+    # 标记为已采纳
+    resp.accepted_by_creator = True
+    resp.accepted_at = datetime.utcnow()
+
+    # 给回答者和创业者加积分（后续可以根据策略调整或复杂化）
+    creator = session.get(User, project.creator_id)
+    responder = session.get(User, resp.user_id)
+
+    if responder:
+        responder.points += 10  # 被采纳回答者 +10 分
+    if creator:
+        creator.points += 2     # 采纳者 +2 分，鼓励认真筛选
+
+    session.add(resp)
+    session.commit()
+    session.refresh(resp)
+
+    return {"ok": True, "response_id": resp.id}
+
+
 # ====================== 创业者查看项目统计 ======================
 
 @app.get("/projects/{project_id}/stats", response_model=ProjectStats)
@@ -323,6 +422,9 @@ def project_stats(project_id: int, session: Session = Depends(get_session)):
         avg_price_min=avg_price_min,
         avg_price_max=avg_price_max,
     )
+
+# 提示：如果你之前已经有旧的 database.db，这里增加了字段（points、accepted_by_creator 等），
+# 本地开发阶段可以删掉旧的 database.db 让 SQLModel 重新建表；线上环境需要做迁移脚本。
 
 # ====================== 预留AI总结接口 ======================
 
